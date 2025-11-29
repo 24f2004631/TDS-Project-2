@@ -60,8 +60,8 @@ graph TD
     C --> D{Scrape Page (Playwright)};
     D --> E{Call LLM with Scraped Data};
     E --> F{LLM Response};
-    F -- type: 'answer' --> G[Submit Direct Answer];
-    F -- type: 'code' --> H{Run Generated Code (uv)};
+    F -- type: answer --> G[Submit Direct Answer];
+    F -- type: code --> H{Run Generated Code (uv)};
     H --> I{Parse Code Output};
     I -- Success --> J[Submit Code's Answer];
     I -- Failure --> K[Enter Retry Loop with stderr];
@@ -135,3 +135,4 @@ The following constants can be adjusted in `main_fixed.py` to tune performance:
 - `RETRY_MARGIN_SEC`: Time threshold below which retries are limited (default: 50s).
 - `SAFETY_MARGIN_SEC`: Time threshold to stop all work on a question (default: 5s).
 - `MAX_EXEC_TIMEOUT_SEC`: Maximum execution time for an LLM-generated script (default: 30s).
+

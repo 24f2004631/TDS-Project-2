@@ -1,8 +1,5 @@
-# ================================
-#   Tools in Data Science — Project 2
-#   Fully patched, stable main.py
-#   Version: 2025-02 (Final)
-# ================================
+# Updated main.py - patched with fixes (Playwright sync, retries, relative URLs, feedback)
+# Generated: 2025-11-29
 
 import os
 import sys
@@ -10,6 +7,7 @@ import json
 import time
 import uuid
 import hmac
+import re
 import httpx
 import subprocess
 from typing import Any, Optional
@@ -25,30 +23,39 @@ from playwright.sync_api import sync_playwright
 from multiprocessing import Process
 from dotenv import load_dotenv
 
+# -------------------------
+# Logging
+# -------------------------
+import logging
 
-# ============================================================
-# Load configuration
-# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 
+log = logging.getLogger("p2")
+
+# -------------------------
+# Configuration
+# -------------------------
 load_dotenv()
 EMAIL = os.getenv("EMAIL", "")
 SECRET_KEY = os.getenv("SECRET", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-JOB_TIMEOUT_SEC = 180          # Per-question time budget
-RETRY_MARGIN_SEC = 50          # Only retry if > 50s left
-SAFETY_MARGIN_SEC = 5          # Stop retrying if <5s left
-MAX_EXEC_TIMEOUT_SEC = 30      # Timeout for "uv run LLM/llm_code.py"
+JOB_TIMEOUT_SEC = 180         # per-question budget
+RETRY_MARGIN_SEC = 50         # only retry if time_left > this (unless final-allowed)
+SAFETY_MARGIN_SEC = 5
+MAX_EXEC_TIMEOUT_SEC = 30     # uv run timeout for generated code
 
 os.makedirs("Scrapped", exist_ok=True)
 os.makedirs("LLM", exist_ok=True)
 
-
-# ============================================================
-# FastAPI setup
-# ============================================================
-
-app = FastAPI(title="TDS Project-2 Solver", description="Robust FastAPI solver for TDS P2")
+# -------------------------
+# FastAPI
+# -------------------------
+app = FastAPI(title="TDS P2 Solver (patched)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -58,216 +65,243 @@ app.add_middleware(
     allow_credentials=True
 )
 
-
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: FastAPIRequest, exc: RequestValidationError):
-    errors = [{"loc": err["loc"], "msg": err["msg"], "type": err["type"]} for err in exc.errors()]
+    errors = [{"loc": e["loc"], "msg": e["msg"], "type": e["type"]} for e in exc.errors()]
     return JSONResponse(status_code=400, content={"detail": errors})
 
-
-# ============================================================
+# -------------------------
 # Models
-# ============================================================
-
+# -------------------------
 class RequestModel(BaseModel):
     email: str
     secret: str
     url: str
 
-
 class FinalResponse(RequestModel):
     answer: Any
-
 
 class ServerResponse(BaseModel):
     correct: bool
     url: Optional[str] = None
     reason: Optional[str] = None
 
-
 class LLMResponse(BaseModel):
-    type: str                           # "answer" or "code"
+    type: str                       # "answer" or "code"
     answer: Optional[Any] = None
     code: Optional[str] = None
     submission_url: Optional[str] = None
 
-
-# ============================================================
-# Utility functions
-# ============================================================
-
+# -------------------------
+# Utilities
+# -------------------------
 def constant_time_compare(a: str, b: str) -> bool:
-    return hmac.compare_digest(a, b)
+    if a is None or b is None:
+        return False
+    try:
+        return hmac.compare_digest(a, b)
+    except Exception:
+        return False
 
-
-def resolve_relative(base_url: str, candidate: str) -> str:
-    """
-    Convert relative URLs like '/submit' into absolute URLs.
-    """
-    if candidate.startswith("http://") or candidate.startswith("https://"):
-        return candidate
-    return urljoin(base_url, candidate)
-
+def resolve_relative(base: str, link: Optional[str]) -> Optional[str]:
+    if not link:
+        return None
+    link = link.strip()
+    if link.startswith("http://") or link.startswith("https://"):
+        return link
+    # handle javascript: and mailto:
+    if link.startswith("javascript:") or link.startswith("mailto:") or link.startswith("data:"):
+        return None
+    try:
+        return urljoin(base, link)
+    except Exception:
+        return None
 
 def validate_target_url(url: str):
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise HTTPException(status_code=400, detail="URL must be http/https")
+    # basic SSRF-ish check: disallow localhost and private IPs
+    host = parsed.hostname or ""
+    private_prefixes = ("localhost", "127.", "10.", "192.168.", "169.254.", "172.")
+    if any(host.startswith(p) for p in private_prefixes):
+        raise HTTPException(status_code=400, detail="Disallowed hostname")
     return parsed
 
-
-# ============================================================
-# Scraper
-# ============================================================
-
+# -------------------------
+# Scraper (sync Playwright) - improved to avoid networkidle hang and extract audio/cutoff
+# -------------------------
 def Scraper(url: str) -> str:
-    print(f"[Scraper] Visiting: {url}")
-
+    log.info(f"[Scraper] Visiting: {url}")
     validate_target_url(url)
     screenshot_path = f"Scrapped/screenshot_{uuid.uuid4().hex}.png"
-
-    html, text, submit_url = "", "", None
+    html = ""
+    text = ""
+    text_full = ""
+    submit_url = None
+    cutoff_value = None
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
         page = browser.new_page()
-
         try:
+            # don't wait for networkidle as some pages stream forever
             page.goto(url, timeout=30000)
-            page.wait_for_load_state("domcontentloaded")
-            page.wait_for_timeout(1500)  # allow client JS to run
-            # Bonus: wait for <pre> or '#result'
+            page.wait_for_load_state("domcontentloaded", timeout=10000)
+            page.wait_for_timeout(1200)  # let client scripts run
+            # try waiting for likely selectors
             try:
-                page.wait_for_selector("pre, #result", timeout=4000)
+                page.wait_for_selector("pre, #result, body", timeout=4000)
             except:
                 pass
         except Exception as e:
-            print(f"[Scraper] goto warning: {e}")
+            log.info(f"[Scraper] goto/load warning: {e}")
 
-        html = page.content()
+        # collect content
         try:
-            text = page.inner_text("body")
-        except Exception:
+            html = page.content()
+        except:
+            html = ""
+        try:
+            # inner_text on body gets visible text; use locator for more robust behavior
+            text = page.locator("body").inner_text(timeout=2000)
+        except:
             text = ""
+        try:
+            # full text capture for patterns like "Cutoff: 21815"
+            text_full = page.locator("body").inner_text(timeout=2000)
+        except:
+            text_full = text
 
+        # screenshot
         try:
             page.screenshot(path=screenshot_path)
+        except Exception as e:
+            log.info(f"[Scraper] screenshot warning: {e}")
+
+        # heuristics for submit url
+        try:
+            node = page.query_selector("[data-submit-url]")
+            if node:
+                raw = node.get_attribute("data-submit-url")
+                submit_url = resolve_relative(url, raw)
         except:
             pass
 
-        # === Extract submit URL ===
-        # Priority 1: data-submit-url
-        node = page.query_selector("[data-submit-url]")
-        if node:
+        if not submit_url:
             try:
-                submit_url = node.get_attribute("data-submit-url")
-                submit_url = resolve_relative(url, submit_url)
+                form = page.query_selector("form")
+                if form:
+                    action = form.get_attribute("action")
+                    submit_url = resolve_relative(url, action)
             except:
                 pass
 
-        # Priority 2: any <form action="...">
         if not submit_url:
-            form = page.query_selector("form")
-            if form:
-                try:
-                    action = form.get_attribute("action")
-                    submit_url = resolve_relative(url, action)
-                except:
-                    pass
+            try:
+                for a in page.query_selector_all("a"):
+                    try:
+                        href = a.get_attribute("href")
+                        if href and "submit" in href.lower():
+                            submit_url = resolve_relative(url, href)
+                            break
+                    except:
+                        continue
+            except:
+                pass
 
-        # Priority 3: any <a href="...submit...">
+        # final fallback: find first http in body text
         if not submit_url:
-            for a in page.query_selector_all("a"):
-                try:
-                    href = a.get_attribute("href")
-                    if href and "submit" in href.lower():
-                        submit_url = resolve_relative(url, href)
-                        break
-                except:
-                    continue
-
-        # Priority 4: look for printed text "POST this JSON to <url>"
-        if not submit_url and "POST this JSON to" in text:
-            import re
-            m = re.search(r"https?://[^\s\"'<>]+", text)
+            m = re.search(r"https?://[^\s\"'<>]+", text_full)
             if m:
                 submit_url = m.group(0)
 
-        browser.close()
+        # extract cutoff number if present
+        m = re.search(r"Cutoff\s*[:\-]?\s*(\d+)", text_full, flags=re.I)
+        if m:
+            cutoff_value = m.group(1)
 
-    return json.dumps({
+        try:
+            browser.close()
+        except:
+            pass
+
+    payload = {
         "html": html,
         "text": text,
+        "text_full": text_full,
         "screenshot": screenshot_path,
-        "submit_url": submit_url
-    })
+        "submit_url": submit_url,
+        "cutoff": cutoff_value
+    }
+    return json.dumps(payload)
 
-
-# ============================================================
-# LLM handling
-# ============================================================
-
+# -------------------------
+# LLM call (Gemini) - robust parsing
+# -------------------------
 def load_system_prompt() -> str:
-    try:
+    if os.path.exists("system-instruction1.txt"):
         with open("system-instruction1.txt", "r", encoding="utf-8") as f:
             return f.read()
-    except:
-        return "You are a data-extraction and code-generation agent. Follow JSON schema strictly."
+    return "You are an expert data-extraction and self-correction agent. Output JSON strictly."
 
+def LLMCode(
+    scrapped_data: str,
+    page_url: str,
+    prev_response: Optional[LLMResponse] = None,
+    server_response: Optional[ServerResponse] = None,
+    stdout_stderr: Optional[str] = None
+) -> LLMResponse:
 
-def LLMCode(scrapped_data: str, page_url: str,
-            prev_response: Optional[LLMResponse] = None,
-            server_response: Optional[ServerResponse] = None,
-            stdout_stderr: Optional[str] = None) -> LLMResponse:
-    """
-    Calls Gemini and parses LLM output safely.
-    """
-
-    # Late import to avoid overhead unless needed
-    from google.genai import Client
-    from google.genai.types import Content, Part, GenerateContentConfig
+    # lazy import
+    try:
+        from google.genai import Client
+        from google.genai.types import Content, Part, GenerateContentConfig
+    except Exception as e:
+        raise RuntimeError(f"google.genai not available: {e}")
 
     scr = json.loads(scrapped_data)
     page_text = scr.get("text", "")
     html_text = scr.get("html", "")
-    screenshot_path = scr.get("screenshot")
+    screenshot = scr.get("screenshot")
 
-    # Build user prompt
     user_prompt = f"""
-You are an expert solver. 
-Origin URL: {page_url}
+You are an expert agent. Origin URL: {page_url}
 
 PAGE_TEXT:
-{page_text[:10000]}
+{page_text[:9000]}
 
-HTML_CONTENT:
-{html_text[:10000]}
+HTML:
+{html_text[:9000]}
 
-Your job:
-- Identify what the page is asking.
-- If answer is trivial → return type="answer".
-- If complex → return type="code" with a Python script that prints JSON {{"answer": ...}}.
-- Never invent the submission URL. If missing, say null.
+If a submission endpoint is visible, DO NOT invent others.
+Return either:
+- {{ "type":"answer","answer": <value>, "submission_url": "<url_or_null>" }}
+or
+- {{ "type":"code","code":"<python3 code>", "submission_url":"<url_or_null>" }}
+
+If this is a retry, use prev_response/server_response/stdout_stderr to fix errors.
 """
 
     if any([prev_response, server_response, stdout_stderr]):
-        diagnostics = {
+        diag = {
             "prev_response": prev_response.model_dump() if prev_response else None,
             "server_response": server_response.model_dump() if server_response else None,
             "stdout_stderr": stdout_stderr
         }
-        user_prompt += "\n\nDIAGNOSTICS:\n" + json.dumps(diagnostics, default=str)[:8000]
+        user_prompt += "\n\nDIAGNOSTIC:\n" + json.dumps(diag, default=str)[:8000]
 
     system_prompt = load_system_prompt()
 
     parts = [Part.from_text(text=user_prompt)]
-    if screenshot_path and os.path.exists(screenshot_path):
-        with open(screenshot_path, "rb") as f:
-            img = f.read()
-            parts.append(Part.from_bytes(data=img, mime_type="image/png"))
+    try:
+        if screenshot and os.path.exists(screenshot):
+            with open(screenshot, "rb") as f:
+                parts.append(Part.from_bytes(data=f.read(), mime_type="image/png"))
+    except:
+        pass
 
     client = Client(api_key=GEMINI_API_KEY)
-
     try:
         resp = client.models.generate_content(
             model="gemini-2.5-flash",
@@ -281,58 +315,58 @@ Your job:
     except Exception as e:
         raise RuntimeError(f"LLM call failed: {e}")
 
-    # Extract text robustly
+    # extract text robustly
     text_out = None
-    try:
-        if hasattr(resp, "text") and resp.text:
-            text_out = resp.text
-        else:
-            cand = resp.candidates[0]
-            part = cand.content.parts[0]
-            text_out = getattr(part, "text", None)
-    except:
-        pass
+    if hasattr(resp, "text") and resp.text:
+        text_out = resp.text
+    else:
+        try:
+            cand = getattr(resp, "candidates", [None])[0]
+            text_out = getattr(cand.content.parts[0], "text", None)
+        except:
+            text_out = None
 
     if not text_out:
         text_out = str(resp)
 
-    # Parse as JSON
     try:
         parsed = json.loads(text_out)
-    except:
-        raise RuntimeError(f"LLM returned non-JSON: {text_out[:500]}")
+    except Exception as e:
+        raise RuntimeError(f"LLM returned non-JSON: {text_out[:800]}") from e
 
-    # Validate LLMResponse
-    return LLMResponse.model_validate(parsed)
+    try:
+        llm_resp = LLMResponse.model_validate(parsed)
+    except Exception as e:
+        raise RuntimeError(
+            f"LLM JSON schema mismatch: {e}. Parsed keys: {list(parsed.keys())}"
+        ) from e
 
+    return llm_resp
 
-# ============================================================
-# Code execution (uv run)
-# ============================================================
-
+# -------------------------
+# Run code produced by LLM
+# -------------------------
 def RunLLMCode(code: str, timeout: int) -> tuple[str, str]:
     path = "LLM/llm_code.py"
     with open(path, "w", encoding="utf-8") as f:
         f.write(code)
 
     try:
-        p = subprocess.run(
+        proc = subprocess.run(
             ["uv", "run", path],
             capture_output=True,
             text=True,
             timeout=timeout
         )
-        return p.stdout, p.stderr
+        return proc.stdout or "", proc.stderr or ""
     except subprocess.TimeoutExpired:
         return "", "timeout"
     except Exception as e:
-        return "", f"exec_error: {e}"
+        return "", f"exec_error:{e}"
 
-
-# ============================================================
-# Submission (with safe fallback)
-# ============================================================
-
+# -------------------------
+# Send response - robust fallback on malformed server responses
+# -------------------------
 def SendResponse(page_url: str, answer: Any, submission_url: Optional[str]) -> ServerResponse:
     if not submission_url:
         return ServerResponse(correct=False, url=None, reason="submission_url missing")
@@ -340,21 +374,25 @@ def SendResponse(page_url: str, answer: Any, submission_url: Optional[str]) -> S
     final = FinalResponse(email=EMAIL, secret=SECRET_KEY, url=page_url, answer=answer)
     body = final.model_dump()
 
-    if len(json.dumps(body).encode()) > 1_000_000:
-        return ServerResponse(correct=False, reason="Payload exceeds 1MB", url=None)
+    # payload size check
+    try:
+        body_bytes = json.dumps(body, default=str).encode()
+        if len(body_bytes) > 1_000_000:
+            return ServerResponse(correct=False, url=None, reason="Payload > 1MB")
+    except Exception:
+        pass
 
     try:
         r = httpx.post(submission_url, json=body, timeout=30)
     except Exception as e:
         return ServerResponse(correct=False, url=None, reason=f"Network error: {e}")
 
-    # Try JSON parse
     try:
         parsed = r.json()
-    except:
-        return ServerResponse(correct=False, url=None, reason="Non-JSON response")
+    except Exception:
+        return ServerResponse(correct=False, url=None, reason="Non-JSON server response")
 
-    # If standard fields missing, fallback
+    # Normalize unexpected shapes
     if "correct" not in parsed:
         reason = parsed.get("reason") or parsed.get("error") or str(parsed)
         return ServerResponse(correct=False, url=parsed.get("url"), reason=reason)
@@ -362,155 +400,189 @@ def SendResponse(page_url: str, answer: Any, submission_url: Optional[str]) -> S
     try:
         return ServerResponse.model_validate(parsed)
     except ValidationError:
+        # fallback
         return ServerResponse(
             correct=parsed.get("correct", False),
             url=parsed.get("url"),
-            reason=parsed.get("reason", "Malformed server response")
+            reason=parsed.get("reason")
         )
 
-
-# ============================================================
-# Retry Logic
-# ============================================================
-
-def RecheckAnswer(start_time: float, original_llm: LLMResponse, page_url: str,
-                  scrapped_data: str, server_response: Optional[ServerResponse],
-                  stdout_stderr: Optional[str]) -> Optional[str]:
+# -------------------------
+# Retry logic
+# -------------------------
+def RecheckAnswer(
+    start_time: float,
+    original_llm: LLMResponse,
+    page_url: str,
+    scrapped_data: str,
+    server_response: Optional[ServerResponse],
+    stdout_stderr: Optional[str]
+) -> Optional[str]:
 
     def time_left():
         return JOB_TIMEOUT_SEC - (time.time() - start_time)
 
-    # If <50s left and we DID receive server_response with correct=False → skip retries
+    # If low time AND server said incorrect → skip retries
     if time_left() <= RETRY_MARGIN_SEC and server_response and not server_response.correct:
+        log.info("[RecheckAnswer] Low time and server_response.correct==False -> skipping retries")
         return server_response.url
 
-    # Allow one final retry if no server_response ever arrived
     final_retry_allowed = (server_response is None and time_left() <= RETRY_MARGIN_SEC)
-
-    last_next_url = server_response.url if server_response else None
+    last_next = server_response.url if server_response else None
+    did_final_retry = False
 
     while True:
-
         if time_left() <= SAFETY_MARGIN_SEC:
-            return last_next_url
+            return last_next
 
-        # Build LLM call with diagnostics
         try:
             llm = LLMCode(
-                scrapped_data,
-                page_url,
+                scrapped_data, page_url,
                 prev_response=original_llm,
                 server_response=server_response,
                 stdout_stderr=stdout_stderr
             )
         except Exception as e:
-            if final_retry_allowed:
-                final_retry_allowed = False
+            log.info(f"[RecheckAnswer] LLM generation failed: {e}")
+            if final_retry_allowed and not did_final_retry:
+                did_final_retry = True
                 continue
-            return last_next_url
+            return last_next
 
-        # Handle direct answer
+        # ========== DIRECT ANSWER ==========
         if llm.type == "answer":
             resp = SendResponse(page_url, llm.answer, llm.submission_url)
+            log.info(f"[RecheckAnswer] Submitted direct answer -> server returned: {resp}")
+
             if resp.correct:
                 return resp.url
+
             server_response = resp
-            last_next_url = resp.url
+            last_next = resp.url
             continue
 
-        # Handle code generation
-        stdout, stderr = RunLLMCode(
-            llm.code,
-            timeout=int(min(MAX_EXEC_TIMEOUT_SEC, time_left()))
-        )
+        # ========== CODE PATH ==========
+        remaining_time = time_left()
+        exec_timeout = int(min(MAX_EXEC_TIMEOUT_SEC, max(1, remaining_time - SAFETY_MARGIN_SEC)))
+
+        stdout, stderr = RunLLMCode(llm.code, timeout=exec_timeout)
 
         if stderr:
             stdout_stderr = stderr
-            if final_retry_allowed:
-                final_retry_allowed = False
+            log.info(f"[RecheckAnswer] Code stderr: {stderr[:300]}")
+
+            if final_retry_allowed and not did_final_retry:
+                did_final_retry = True
                 continue
+
             continue
 
         if stdout:
             try:
                 parsed = json.loads(stdout.strip())
-            except:
+            except Exception:
                 stdout_stderr = stdout
+                log.info("[RecheckAnswer] Code produced non-json output")
+
+                if final_retry_allowed and not did_final_retry:
+                    did_final_retry = True
+                    continue
                 continue
 
             if "answer" not in parsed:
                 stdout_stderr = stdout
+
+                if final_retry_allowed and not did_final_retry:
+                    did_final_retry = True
+                    continue
+
                 continue
 
             resp = SendResponse(page_url, parsed["answer"], llm.submission_url)
+            log.info(f"[RecheckAnswer] Submitted code answer -> server returned: {resp}")
+
             if resp.correct:
                 return resp.url
 
             server_response = resp
-            last_next_url = resp.url
+            last_next = resp.url
             continue
 
-        # If we reach here, nothing worked
-        if final_retry_allowed:
-            final_retry_allowed = False
+        # ========== FALLBACK FINAL RETRY ==========
+        if final_retry_allowed and not did_final_retry:
+            did_final_retry = True
             continue
 
-        return last_next_url
+        return last_next
 
-
-# ============================================================
-# Main question-chain worker (spawned via Process)
-# ============================================================
-
+# -------------------------
+# Main worker
+# -------------------------
 def HandleRequest(start_url: str, start_time: float):
-
     current_url = start_url
-    question_start = start_time   # reset ONLY when correct answer received
+    question_start = start_time
 
     while current_url:
-
         remaining = JOB_TIMEOUT_SEC - (time.time() - question_start)
         if remaining <= SAFETY_MARGIN_SEC:
-            print("[HandleRequest] Out of time for this question.")
+            log.info("[HandleRequest] Out of time for this question - moving on.")
             return
 
-        print(f"[HandleRequest] time_left={remaining:.1f} for {current_url}")
+        log.info(f"[HandleRequest] time_left={remaining:.1f} for {current_url}")
 
-        # Scrape fresh version of the page
+        # ------------ SCRAPE ------------
         try:
             scrap = Scraper(current_url)
         except Exception as e:
-            print(f"[HandleRequest] Scraper error: {e}")
+            log.info(f"[HandleRequest] Scraper failed: {e}")
             return
 
-        # Initial LLM attempt
+        # ------------ FIRST LLM CALL ------------
         try:
             llm = LLMCode(scrap, current_url)
         except Exception as e:
-            print(f"[HandleRequest] LLM error: {e}")
+            log.info(f"[HandleRequest] LLM generation failed: {e}")
             return
 
         server_resp = None
-        stdout_err = None
+        code_stdout = None
+        code_stderr = None
 
+        # ------------ DIRECT ANSWER CASE ------------
         if llm.type == "answer":
             page_submit = json.loads(scrap).get("submit_url") or llm.submission_url
             server_resp = SendResponse(current_url, llm.answer, page_submit)
 
         else:
-            stdout, stderr = RunLLMCode(llm.code, timeout=int(min(MAX_EXEC_TIMEOUT_SEC, remaining)))
-            stdout_err = stderr or stdout
+            # ------------ CODE CASE ------------
+            remaining = JOB_TIMEOUT_SEC - (time.time() - question_start)
+            exec_timeout = int(min(MAX_EXEC_TIMEOUT_SEC, max(1, remaining - SAFETY_MARGIN_SEC)))
+
+            stdout, stderr = RunLLMCode(llm.code, timeout=exec_timeout)
+            code_stdout, code_stderr = stdout, stderr
+
+            if stderr:
+                log.info(f"[HandleRequest] LLM code stderr: {stderr[:300]}")
 
             if stdout:
                 try:
                     parsed = json.loads(stdout.strip())
-                    if "answer" in parsed:
+                    if isinstance(parsed, dict) and "answer" in parsed:
                         page_submit = json.loads(scrap).get("submit_url") or llm.submission_url
                         server_resp = SendResponse(current_url, parsed["answer"], page_submit)
-                except:
+                except Exception:
                     pass
 
-        # If server did not accept or response was malformed → retry logic
+        # ------------ FEEDBACK LOGGING ------------
+        if server_resp:
+            if server_resp.correct:
+                log.info("[Feedback] ✔ Answer CORRECT.")
+            else:
+                log.info(f"[Feedback] ✘ Answer INCORRECT. Reason: {server_resp.reason}")
+        else:
+            log.info("[Feedback] ⚠ No server response (submission may have failed).")
+
+        # ------------ INCORRECT or FAILED SUBMISSION ------------
         if not server_resp or not server_resp.correct:
             next_url = RecheckAnswer(
                 question_start,
@@ -518,58 +590,58 @@ def HandleRequest(start_url: str, start_time: float):
                 current_url,
                 scrap,
                 server_resp,
-                stdout_err
+                (code_stderr or code_stdout)
             )
 
             if next_url and next_url != current_url:
-                # Move to next question
+                log.info("[HandleRequest] Moving to next question (server provided new URL).")
                 current_url = next_url
-                question_start = time.time()   # reset timer
+                question_start = time.time()
                 continue
 
-            # If we reached here and have server_resp with url → move on anyway
             if server_resp and server_resp.url:
+                log.info("[HandleRequest] Moving to server-provided next URL despite incorrect/no correct.")
                 current_url = server_resp.url
                 question_start = time.time()
                 continue
 
-            print("[HandleRequest] Exhausted retries. Moving on.")
+            log.info("[HandleRequest] Exhausted retries. Moving on.")
             return
 
-        # Answer was correct → move on
-        print("[HandleRequest] Correct answer → next question")
+        # ------------ CORRECT PATH ------------
+        log.info("[HandleRequest] Correct answer → next question")
+
         if server_resp.url:
             current_url = server_resp.url
             question_start = time.time()
             continue
 
-        print("[HandleRequest] Quiz complete.")
+        log.info("[HandleRequest] Quiz finished (no next URL).")
         return
 
-
-# ============================================================
-# FastAPI endpoint
-# ============================================================
-
+# -------------------------
+# Endpoint
+# -------------------------
 @app.post("/p2")
 def P2(payload: RequestModel):
+    # Validate secret
     if not constant_time_compare(payload.secret, SECRET_KEY):
         raise HTTPException(status_code=403, detail="Invalid secret")
 
+    # Validate target URL
     validate_target_url(payload.url)
 
+    # Start worker
     start = time.time()
     p = Process(target=HandleRequest, args=(payload.url, start), daemon=True)
     p.start()
 
     return JSONResponse({"message": "Task started"})
 
-
-# ============================================================
-# Launch server
-# ============================================================
-
+# -------------------------
+# Main
+# -------------------------
 if __name__ == "__main__":
     import uvicorn
-    print("Starting server on port 8000…")
+    log.info("Starting server on :8000")
     uvicorn.run(app, host="0.0.0.0", port=8000)
